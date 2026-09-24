@@ -12,6 +12,9 @@ dependencies = [
     "requests>=2.32",
     "pydantic>=2.0",
     "slack-sdk>=3.27",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
 ]
 
 [build-system]
@@ -19,4 +22,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["agent*"]
+include = ["agent*", "api*"]
