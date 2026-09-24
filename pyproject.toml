@@ -1,0 +1,18 @@
+[project]
+name = "rca-agent"
+version = "0.1.0"
+description = "LangGraph root-cause analysis agent for on-call incident response"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-anthropic>=0.3",
+    "python-dotenv>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
