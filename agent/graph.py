@@ -1,7 +1,13 @@
+import os
 from typing import TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
+
+from agent.tools.k8s_graph import get_ownership
+from agent.tools.prometheus import query_metrics
+from agent.tools.loki import query_logs
+from agent.tools.tempo import query_traces
 
 
 class Alert(TypedDict):
@@ -26,35 +32,31 @@ class State(TypedDict):
 
 
 def fetch_ownership(state: State) -> State:
-    # placeholder for the Neo4j/kuzu knowledge-graph MCP tool
-    state["owner_info"] = {
-        "service": state["alert"]["service"],
-        "team": "unknown",
-        "on_call": "unknown",
-    }
+    state["owner_info"] = get_ownership(state["alert"]["service"])
     return state
 
 
 def fetch_metrics(state: State) -> State:
-    # placeholder for the Prometheus MCP tool (last 15m, scoped to service)
-    state["metrics"] = {"cpu": "n/a", "error_rate": "n/a", "latency_p99": "n/a"}
+    state["metrics"] = query_metrics(state["alert"]["service"])
     return state
 
 
 def fetch_logs(state: State) -> State:
-    # placeholder for the Loki MCP tool
-    state["logs"] = {"error_lines": []}
+    state["logs"] = query_logs(state["alert"]["service"])
     return state
 
 
 def fetch_traces(state: State) -> State:
-    # placeholder for the Tempo MCP tool
-    state["traces"] = {"slow_spans": []}
+    state["traces"] = query_traces(state["alert"]["service"])
     return state
 
 
 def rank_hypotheses(state: State) -> State:
-    llm = ChatAnthropic(model="claude-sonnet-5")
+    llm = ChatOpenAI(
+        model=os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5"),
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
     prompt = (
         "You are a root-cause analysis agent for on-call incident response.\n"
         f"Alert: {state['alert']}\n"
