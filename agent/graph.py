@@ -1,13 +1,16 @@
-import os
-from typing import TypedDict
+from typing import Optional, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 
 from agent.tools.k8s_graph import get_ownership
 from agent.tools.prometheus import query_metrics
 from agent.tools.loki import query_logs
 from agent.tools.tempo import query_traces
+from agent.ranking.rank import generate_hypotheses
+from agent.notify.slack import send_brief
+from agent.actions.argocd import rollback
+from agent.actions.pagerduty import escalate
+from agent.audit.log import record
 
 
 class Alert(TypedDict):
@@ -19,6 +22,7 @@ class Alert(TypedDict):
 class Hypothesis(TypedDict):
     cause: str
     confidence: float
+    sources: list[str]
     evidence: list[str]
 
 
@@ -29,6 +33,7 @@ class State(TypedDict):
     logs: dict
     traces: dict
     hypotheses: list[Hypothesis]
+    slack_result: dict
 
 
 def fetch_ownership(state: State) -> State:
@@ -51,47 +56,64 @@ def fetch_traces(state: State) -> State:
     return state
 
 
-def rank_hypotheses(state: State) -> State:
-    llm = ChatOpenAI(
-        model=os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5"),
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"],
+def llm_call(state: State) -> State:
+    state["hypotheses"] = generate_hypotheses(
+        state["alert"],
+        state["owner_info"],
+        state["metrics"],
+        state["logs"],
+        state["traces"],
     )
-    prompt = (
-        "You are a root-cause analysis agent for on-call incident response.\n"
-        f"Alert: {state['alert']}\n"
-        f"Ownership: {state['owner_info']}\n"
-        f"Metrics (last 15m): {state['metrics']}\n"
-        f"Logs: {state['logs']}\n"
-        f"Traces: {state['traces']}\n\n"
-        "List the top 3 candidate root causes ranked by confidence, one per line, "
-        "each as: cause | confidence(0-1) | supporting evidence"
-    )
-    response = llm.invoke(prompt)
+    return state
 
-    hypotheses: list[Hypothesis] = []
-    for line in response.content.strip().splitlines():
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) == 3:
-            cause, confidence, evidence = parts
-            try:
-                confidence_val = float(confidence)
-            except ValueError:
-                confidence_val = 0.0
-            hypotheses.append(
-                {"cause": cause, "confidence": confidence_val, "evidence": [evidence]}
-            )
 
-    state["hypotheses"] = sorted(
-        hypotheses, key=lambda h: h["confidence"], reverse=True
+def record_considered(state: State) -> State:
+    record(
+        {
+            "type": "hypotheses_considered",
+            "alert": state["alert"],
+            "hypotheses": state["hypotheses"],
+        }
     )
+    return state
+
+
+def notify_slack(state: State) -> State:
+    state["slack_result"] = send_brief(state["alert"], state["hypotheses"])
     return state
 
 
 def route_after_ownership(state: State) -> str:
     if state["alert"]["severity"] == "critical":
-        return "rank_hypotheses"
+        return "llm_call"
     return "fetch_metrics"
+
+
+def execute_approved_action(
+    action: str, service: str, top_cause: Optional[str]
+) -> dict:
+    if action == "approve_rollback":
+        action_name = "argocd_rollback"
+        result = rollback(service)
+    elif action == "escalate":
+        action_name = "pagerduty_escalate"
+        result = escalate(
+            summary=f"Escalating {service}: {top_cause or 'unspecified cause'}",
+            dedup_key=service,
+        )
+    else:
+        action_name = action
+        result = {"error": f"unknown action: {action}"}
+
+    record(
+        {
+            "type": "action_executed",
+            "action": action_name,
+            "service": service,
+            "result": result,
+        }
+    )
+    return result
 
 
 def build_graph():
@@ -101,14 +123,18 @@ def build_graph():
     graph.add_node("fetch_metrics", fetch_metrics)
     graph.add_node("fetch_logs", fetch_logs)
     graph.add_node("fetch_traces", fetch_traces)
-    graph.add_node("rank_hypotheses", rank_hypotheses)
+    graph.add_node("llm_call", llm_call)
+    graph.add_node("record_considered", record_considered)
+    graph.add_node("notify_slack", notify_slack)
 
     graph.add_edge(START, "fetch_ownership")
     graph.add_edge("fetch_ownership", "fetch_metrics")
     graph.add_edge("fetch_metrics", "fetch_logs")
     graph.add_edge("fetch_logs", "fetch_traces")
-    graph.add_edge("fetch_traces", "rank_hypotheses")
-    graph.add_edge("rank_hypotheses", END)
+    graph.add_edge("fetch_traces", "llm_call")
+    graph.add_edge("llm_call", "record_considered")
+    graph.add_edge("record_considered", "notify_slack")
+    graph.add_edge("notify_slack", END)
 
     return graph.compile()
 
